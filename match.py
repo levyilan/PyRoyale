@@ -1,21 +1,31 @@
 from twisted.internet import reactor
 from buffer import Buffer
+import os
+import json
 import random
+import jsonschema
+
+levelJsonSchema = json.loads(open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "levelSchema.json"), "r").read())
 
 class Match(object):
-    def __init__(self, server):
+    def __init__(self, server, roomName, private):
         self.server = server
 
+        self.forceLevel = ""
+        self.customLevelData = ""
         self.world = "lobby"
+        self.roomName = roomName
         self.closed = False
+        self.private = private
         self.playing = False
         self.autoStartTimer = None
-        self.startingTimer = None
         self.startTimer = int()
         self.votes = int()
         self.winners = int()
         self.lastId = -1
         self.players = list()
+
+        self.goldFlowerTaken = bool()
 
     def getNextPlayerId(self):
         self.lastId += 1
@@ -45,8 +55,7 @@ class Match(object):
 
         if player.voted:
             self.votes -= 1
-
-        if not self.playing and self.votes >= len(self.players) * 0.85:
+        elif self.server.enableVoteStart and not self.playing and self.votes >= len(self.players) * self.server.voteRateToStart:
             self.start()
 
     def getPlayer(self, pid):
@@ -65,16 +74,16 @@ class Match(object):
                 continue
             player.sendJSON(j)
 
-    def broadBin(self, code, buff):
-        buff = buff.toString() if isinstance(buff, Buffer) else buff
+    def broadBin(self, code, buff, ignore = None):
+        buff = buff.toBytes() if isinstance(buff, Buffer) else buff
         for player in self.players:
-            if not player.loaded:
+            if not player.loaded or (ignore is not None and player.id == ignore):
                 continue
             player.sendBin(code, buff)
 
     def broadLoadWorld(self):
         for player in self.players:
-            player.loadWorld(self.world)
+            player.loadWorld(self.world, self.customLevelData)
 
     def broadStartTimer(self, time):
         self.startTimer = time * 30
@@ -89,34 +98,53 @@ class Match(object):
             self.closed = True
 
     def broadPlayerList(self):
-        data = self.getPlayersData()
+        if self.closed:
+            return # Don't broad player list when in main game
+        data = {"packets": [
+            {"players": self.getPlayersData(),
+             "type": "g12"}
+        ], "type": "s01"}
         for player in self.players:
             if not player.loaded:
                 continue
-            player.sendJSON({"packets": [
-                {"players": (data + ([player.getSimpleData()] if player.dead else [])),
-                 "type": "g12"}
-            ], "type": "s01"})
+            player.sendJSON(data)
 
     def getPlayersData(self):
         playersData = []
         for player in self.players:
-            if not player.loaded or player.dead:
-                continue
+            # We need to include even not loaded players as the remaining player count
+            # only updates on the start timer screen
             playersData.append(player.getSimpleData())
         return playersData
 
+    def broadPlayerUpdate(self, player, pktData):
+        data = Buffer().writeInt16(player.id).write(pktData).toBytes()
+        for p in self.players:
+            if not p.loaded or p.id == player.id:
+                continue
+            if not p.win and (p.level != player.level or p.zone != player.zone):
+                continue
+            p.sendBin(0x12, data)
+
+    def onPlayerEnter(self, player):
+        pass
+
     def onPlayerReady(self, player):
-        if not self.playing: # Ensure that the game starts even with fewer players
-            try:
-                self.autoStartTimer.cancel()
-            except:
-                pass
-            self.autoStartTimer = reactor.callLater(30, self.start, True)
+        if (not self.private or self.roomName != "") and not self.playing: # Ensure that the game starts even with fewer players
+            if self.autoStartTimer is not None:
+                try:
+                    self.autoStartTimer.reset(self.server.autoStartTime)
+                except:
+                    pass
+            else:
+                self.autoStartTimer = reactor.callLater(self.server.autoStartTime, self.start, True)
+
+        if self.world == "lobby" and self.goldFlowerTaken:
+            self.broadBin(0x20, Buffer().writeInt16(-1).writeInt8(0).writeInt8(0).writeInt32(458761).writeInt8(0))
 
         if self.world == "lobby" or not player.lobbier or self.closed:
             for p in self.players:
-                if not p.loaded:
+                if not p.loaded or p == player:
                     continue
                 player.sendBin(0x10, p.serializePlayerObject())
             if self.startTimer != 0 or self.closed:
@@ -124,33 +152,65 @@ class Match(object):
         self.broadPlayerList()
 
         if not self.playing:
-            if self.startingTimer is None and len(self.getPlayersData()) >= 15:
-                self.startingTimer = reactor.callLater(5, self.start)
-            elif self.votes >= len(self.players) * 0.85:
+            if len(self.players) >= self.server.playerCap:
+                self.start(True)
+            # This is needed because if the votes is sufficient to start but there isn't sufficient players,
+            # when someone enters the game, it can make it possible to start the game.
+            elif self.server.enableVoteStart and self.votes >= len(self.players) * self.server.voteRateToStart:
                 self.start()
+
+    def onPlayerWarp(self, player, level, zone):
+        for p in self.players:
+            if not p.loaded or p.lastUpdatePkt is None or p.id == player.id:
+                continue
+            # Tell fellows that the player warped
+            if p.level == player.level and p.zone == player.zone:
+                p.sendBin(0x12, Buffer().writeInt16(player.id).writeInt8(level).writeInt8(zone).write(player.lastUpdatePkt[2:]))
+                continue
+            elif p.level != level or p.zone != zone:
+                continue
+            player.sendBin(0x12, Buffer().writeInt16(p.id).write(p.lastUpdatePkt))
 
     def voteStart(self):
         self.votes += 1
-        if not self.playing and self.votes >= len(self.players) * 0.85:
+        if self.server.enableVoteStart and not self.playing and self.votes >= len(self.players) * self.server.voteRateToStart:
             self.start()
 
     def start(self, forced = False):
-        if self.playing or (not forced and len(self.players) < 10): # We need at-least 10 players to start
+        if self.playing or (not forced and len(self.players) < (1 if self.private and self.roomName == "" else self.server.playerMin)): # We need at-least 10 players to start
             return
         self.playing = True
-        
-        try:
-            self.startingTimer.cancel()
-        except:
-            pass
         
         try:
             self.autoStartTimer.cancel()
         except:
             pass
         
-        self.world = random.choice(["world-1", "world-2", "world-3", "world-5", "world-6", "world-l1", "world-p"])
-        self.broadLoadWorld()
+        self.world = self.forceLevel if self.forceLevel != "" else self.server.getRandomWorld()
 
-        reactor.callLater(1, self.broadStartTimer, 7)
-        
+        if not self.private:
+            reactor.callLater(3, self.broadLoadWorld)
+            reactor.callLater(4, self.broadStartTimer, self.server.startTimer)
+        else:
+            self.broadLoadWorld()
+            reactor.callLater(1, self.broadStartTimer, self.server.startTimer)
+            
+    def validateCustomLevel(self, level):
+        lk = json.loads(level)
+        jsonschema.validate(instance=lk, schema=levelJsonSchema)
+
+    def selectLevel(self, level):
+        if level == "" or level in self.server.worlds:
+            self.forceLevel = level
+            self.broadLevelSelect()
+
+    def broadLevelSelect(self):
+        data = {"type":"gsl", "name":self.forceLevel, "status":"update", "message":""}
+        for player in self.players:
+            player.sendJSON(data)
+
+    def selectCustomLevel(self, level):
+        self.validateCustomLevel(level)
+        self.forceLevel = "custom"
+        self.customLevelData = level
+        self.broadLevelSelect()
